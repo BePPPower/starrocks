@@ -10,6 +10,7 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <fmt/format.h>
+#include <linux/version.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -27,6 +28,14 @@
 #include "gutil/strings/substitute.h"
 #include "util/errno.h"
 #include "util/slice.h"
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+extern "C" {
+#include "liburing.h"
+}
+#define USE_IO_URING
+#else
+#undef USE_IO_URING
+#endif
 
 namespace starrocks {
 
@@ -94,10 +103,75 @@ static Status do_open(const string& filename, Env::OpenMode mode, int* fd) {
     return Status::OK();
 }
 
+static Status do_readv_at_uring(int fd, const std::string& filename, uint64_t offset, const Slice* res, size_t res_cnt,
+                                uint64_t* read_bytes) {
+    LOG(INFO) << "(ftw uring): filename=" << filename << " res_cnt=" << res_cnt;
+    size_t bytes_req = 0;
+    struct iovec iov[res_cnt];
+    for (size_t i = 0; i < res_cnt; ++i) {
+        const Slice& result = res[i];
+        bytes_req += result.size;
+        iov[i] = {result.data, result.size};
+    }
+
+    struct io_uring ring;
+    ssize_t ret;
+    ret = io_uring_queue_init(res_cnt, &ring, 0);
+    if (PREDICT_FALSE(res < 0)) {
+        return io_error(filename, errno);
+    }
+
+    uint64_t cur_offset = offset;
+    struct io_uring_sqe* sqe;
+    for (int i = 0; i < res_cnt; ++i) {
+        sqe = io_uring_get_sqe(&ring);
+        if (!sqe) {
+            break;
+        }
+        // todo(ftw) here 1 indicates the amouts of iov,can it be setted to res_cnt?
+        io_uring_prep_readv(sqe, fd, &iov[i], 1, cur_offset);
+        cur_offset += iov[i].iov_len;
+    }
+
+    ret = io_uring_submit(&ring);
+    if (ret < 0 || ret != res_cnt) {
+        return io_error(filename, errno);
+    }
+
+    int pending = ret;
+    size_t rem = bytes_req;
+    struct io_uring_cqe* cqe;
+    for (int i = 0; i < pending; ++i) {
+        ret = io_uring_wait_cqe(&ring, &cqe);
+        if (ret < 0) {
+            return io_error(filename, errno);
+        }
+        if (cqe->res >= 0) {
+            size_t read_res = cqe->res;
+            rem -= read_res;
+        }
+        io_uring_cqe_seen(&ring, cqe);
+    }
+    if (PREDICT_FALSE(rem > 0)) {
+        if (read_bytes != nullptr) {
+            *read_bytes = bytes_req - rem;
+        }
+        return Status::EndOfFile(strings::Substitute("EOF trying to read $0 bytes at offset $1", bytes_req, offset));
+    }
+    DCHECK_EQ(0, rem);
+    LOG(INFO) << "(ftw uring) read ok, bytes_req=" << bytes_req;
+    io_uring_queue_exit(&ring);
+    return Status::OK();
+}
+
 static Status do_readv_at(int fd, const std::string& filename, uint64_t offset, const Slice* res, size_t res_cnt,
                           uint64_t* read_bytes) {
     // Convert the results into the iovec vector to request
     // and calculate the total bytes requested
+
+#if defined(USE_IO_URING)
+    return do_readv_at_uring(fd, filename, offset, res, res_cnt, read_bytes);
+#endif
     size_t bytes_req = 0;
     struct iovec iov[res_cnt];
     for (size_t i = 0; i < res_cnt; i++) {

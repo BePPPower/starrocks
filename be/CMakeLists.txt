@@ -283,6 +283,9 @@ set_target_properties(simdjson PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/li
 add_library(velocypack STATIC IMPORTED)
 set_target_properties(velocypack PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/libvelocypack.a)
 
+add_library(uring STATIC IMPORTED)
+set_target_properties(uring PROPERTIES IMPORTED_LOCATION ${THIRDPARTY_DIR}/lib/liburing.a)
+
 find_program(THRIFT_COMPILER thrift ${CMAKE_SOURCE_DIR}/bin)
 
 # Check if functions are supported in this platform. All flags will generated
@@ -527,6 +530,7 @@ set(STARROCKS_DEPENDENCIES
     librdkafka_cpp
     librdkafka
     velocypack
+    uring
     ${WL_END_GROUP}
 )
 
